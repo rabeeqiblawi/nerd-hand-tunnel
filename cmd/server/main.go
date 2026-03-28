@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -13,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
 
 // ─── Data models ────────────────────────────────────────────────────────────
@@ -42,6 +46,31 @@ type Client struct {
 	Notified    bool      `json:"-"`
 }
 
+// ─── WebSocket proxy types ───────────────────────────────────────────────────
+
+// wsMsg is the JSON envelope exchanged over the daemon ↔ server WebSocket.
+type wsMsg struct {
+	Type   string `json:"type"`             // ws_open | ws_message | ws_close
+	ConnID string `json:"conn_id,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Query  string `json:"query,omitempty"`
+	Data   string `json:"data,omitempty"`   // base64-encoded payload
+}
+
+// daemonWSConn represents one daemon's persistent WebSocket connection.
+// phones maps conn_id → chan wsMsg for routing daemon→phone messages.
+type daemonWSConn struct {
+	conn   *websocket.Conn
+	sendMu sync.Mutex
+	phones sync.Map // conn_id → chan wsMsg
+}
+
+func (d *daemonWSConn) send(ctx context.Context, msg wsMsg) error {
+	d.sendMu.Lock()
+	defer d.sendMu.Unlock()
+	return wsjson.Write(ctx, d.conn, msg)
+}
+
 // ─── Relay types ─────────────────────────────────────────────────────────────
 
 type relayRequest struct {
@@ -68,23 +97,26 @@ type pendingRelayReq struct {
 // ─── In-memory store ────────────────────────────────────────────────────────
 
 type Store struct {
-	mu          sync.RWMutex
-	peers       map[string]*Peer        // peer_id → Peer
-	codes       map[string]*PairingCode // code → PairingCode
-	clients     map[string][]*Client    // peer_id → []Client
-	ipCounter   int
-	relayQueues map[string]chan *pendingRelayReq
-	relayMu     sync.Mutex
+	mu           sync.RWMutex
+	peers        map[string]*Peer        // peer_id → Peer
+	codes        map[string]*PairingCode // code → PairingCode
+	clients      map[string][]*Client    // peer_id → []Client
+	ipCounter    int
+	relayQueues  map[string]chan *pendingRelayReq
+	relayMu      sync.Mutex
 	relayPending sync.Map // req_id → *pendingRelayReq
+	daemonWSConns map[string]*daemonWSConn // peer_id → daemon WS
+	daemonWSMu   sync.RWMutex
 }
 
 func NewStore() *Store {
 	return &Store{
-		peers:       make(map[string]*Peer),
-		codes:       make(map[string]*PairingCode),
-		clients:     make(map[string][]*Client),
-		ipCounter:   0,
-		relayQueues: make(map[string]chan *pendingRelayReq),
+		peers:         make(map[string]*Peer),
+		codes:         make(map[string]*PairingCode),
+		clients:       make(map[string][]*Client),
+		ipCounter:     0,
+		relayQueues:   make(map[string]chan *pendingRelayReq),
+		daemonWSConns: make(map[string]*daemonWSConn),
 	}
 }
 
@@ -486,10 +518,121 @@ func (s *Store) handleRelayRespond(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// GET /v1/daemon/{peer_id}/ws
+// Daemon connects here to receive WebSocket proxy requests.
+// Requires X-App-Secret. Blocks until daemon disconnects.
+func (s *Store) handleDaemonWS(w http.ResponseWriter, r *http.Request) {
+	peerID := r.PathValue("peer_id")
+
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+
+	dws := &daemonWSConn{conn: conn}
+	s.daemonWSMu.Lock()
+	s.daemonWSConns[peerID] = dws
+	s.daemonWSMu.Unlock()
+	log.Printf("[daemon-ws] peer_id=%s connected", peerID)
+
+	defer func() {
+		s.daemonWSMu.Lock()
+		if s.daemonWSConns[peerID] == dws {
+			delete(s.daemonWSConns, peerID)
+		}
+		s.daemonWSMu.Unlock()
+		conn.Close(websocket.StatusNormalClosure, "")
+		log.Printf("[daemon-ws] peer_id=%s disconnected", peerID)
+	}()
+
+	ctx := r.Context()
+	for {
+		var msg wsMsg
+		if err := wsjson.Read(ctx, conn, &msg); err != nil {
+			break
+		}
+		if ch, ok := dws.phones.Load(msg.ConnID); ok {
+			select {
+			case ch.(chan wsMsg) <- msg:
+			default:
+			}
+		}
+	}
+}
+
+// handleRelayWSProxy bridges a phone WebSocket through the daemon's persistent WS.
+func (s *Store) handleRelayWSProxy(w http.ResponseWriter, r *http.Request) {
+	peerID := r.PathValue("peer_id")
+	path := "/" + r.PathValue("rest")
+
+	s.daemonWSMu.RLock()
+	dws := s.daemonWSConns[peerID]
+	s.daemonWSMu.RUnlock()
+	if dws == nil {
+		http.Error(w, "daemon not connected via WebSocket", http.StatusServiceUnavailable)
+		return
+	}
+
+	phoneConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	defer phoneConn.Close(websocket.StatusNormalClosure, "")
+
+	connID := randomHex(16)
+	phoneCh := make(chan wsMsg, 64)
+	dws.phones.Store(connID, phoneCh)
+	defer dws.phones.Delete(connID)
+
+	ctx := r.Context()
+
+	if err := dws.send(ctx, wsMsg{
+		Type:   "ws_open",
+		ConnID: connID,
+		Path:   path,
+		Query:  r.URL.RawQuery,
+	}); err != nil {
+		return
+	}
+
+	// Phone → Daemon
+	go func() {
+		for {
+			_, data, err := phoneConn.Read(ctx)
+			if err != nil {
+				_ = dws.send(context.Background(), wsMsg{Type: "ws_close", ConnID: connID})
+				return
+			}
+			_ = dws.send(context.Background(), wsMsg{
+				Type:   "ws_message",
+				ConnID: connID,
+				Data:   base64.StdEncoding.EncodeToString(data),
+			})
+		}
+	}()
+
+	// Daemon → Phone
+	for msg := range phoneCh {
+		if msg.Type == "ws_close" {
+			return
+		}
+		data, _ := base64.StdEncoding.DecodeString(msg.Data)
+		if err := phoneConn.Write(ctx, websocket.MessageText, data); err != nil {
+			return
+		}
+	}
+}
+
 // /v1/relay/{peer_id}/{rest...}
 // No auth. Proxies any HTTP method/path from the phone to the daemon via the
 // relay queue. Waits up to 120s for the daemon to respond.
 func (s *Store) handleRelayProxy(w http.ResponseWriter, r *http.Request) {
+	// WebSocket upgrade → bridge to daemon's persistent WS connection.
+	if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
+		s.handleRelayWSProxy(w, r)
+		return
+	}
+
 	peerID := r.PathValue("peer_id")
 	rest := r.PathValue("rest")
 
@@ -624,6 +767,9 @@ func main() {
 	mux.HandleFunc("/v1/pair/generate", auth(store.handlePairGenerate))
 	mux.HandleFunc("/v1/pair/redeem", auth(store.handlePairRedeem))
 	mux.HandleFunc("/v1/peer/clients", auth(store.handlePeerClients))
+
+	// Daemon WebSocket endpoint (persistent connection for WS proxying).
+	mux.HandleFunc("GET /v1/daemon/{peer_id}/ws", auth(store.handleDaemonWS))
 
 	// Relay endpoints — specific method routes take priority over the catch-all
 	// in Go 1.22+ ServeMux. Register before the "/" catch-all.
