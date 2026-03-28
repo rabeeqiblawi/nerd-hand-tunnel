@@ -1,120 +1,174 @@
 # nerdhand-tunnel
 
-Self-hosted [NetBird](https://netbird.io) P2P stack for the NerdHand companion app.
-The VPS only brokers the initial handshake — all traffic flows directly between devices over an encrypted WireGuard tunnel.
+Lightweight P2P WireGuard signaling system for the NerdHand companion app.
+The VPS only brokers key exchange — all app traffic flows directly between the phone and PC over an encrypted WireGuard tunnel.
 
 ## Architecture
 
 ```
-  ┌──────────────┐       WireGuard (direct P2P)        ┌──────────────────┐
-  │  Phone       │ ◄─────────────────────────────────► │  Host Mac/PC     │
-  │  Flutter app │                                      │  daemon.py :8000 │
-  └──────┬───────┘                                      └────────┬─────────┘
-         │  handshake only                                       │
-         │  (key exchange + ICE)                                 │
-         └───────────────────┬───────────────────────────────────┘
-                             ▼
-                    ┌─────────────────┐
-                    │  VPS            │
-                    │  NetBird stack  │
-                    │  (signaling)    │
-                    └─────────────────┘
+[Flutter App] <-- WireGuard P2P --> [PC Daemon :8000]
+                    ^
+        only key-exchange via VPS
+                    ^
+              [Signaling Server]
 ```
 
-**The VPS only handles the handshake.** Once the two peers exchange keys and negotiate a direct path, all traffic flows peer-to-peer over an encrypted WireGuard tunnel — the VPS sees nothing. Coturn (TURN) only kicks in as a fallback when direct P2P is blocked by symmetric NAT.
-
-## What runs on the VPS
-
-| Container | Purpose |
-|-----------|---------|
-| `management` | NetBird management server — enrollment, ACLs, key registry |
-| `signal` | ICE/STUN signal server — helps peers find each other |
-| `coturn` | TURN relay — fallback only, used when direct P2P fails |
-| `caddy` | Reverse proxy — auto TLS via Let's Encrypt |
+- The VPS signaling server exchanges public keys and pairing codes only. It never routes traffic.
+- After pairing, the Flutter app connects directly to the PC over WireGuard.
+- Only requests bearing the correct `X-App-Secret` header are accepted — no other client can use the API.
 
 ## Directory layout
 
 ```
 nerdhand-tunnel/
-├── docker-compose.yml     ← full NetBird self-hosted stack
-├── .env.example           ← required environment variables
-├── Caddyfile              ← Caddy reverse-proxy + TLS config
-├── management.json        ← NetBird management server config
-├── turnserver.conf        ← Coturn STUN/TURN config
-└── scripts/
-    ├── setup_vps.sh       ← one-shot VPS bootstrap (Docker + firewall + start)
-    └── setup_host.sh      ← enroll the host Mac/PC into the NetBird network
+├── cmd/
+│   ├── server/main.go     ← signaling server (runs on VPS in Docker)
+│   └── client/main.go     ← PC WireGuard manager + signaling client
+├── go.mod
+├── Dockerfile
+├── docker-compose.yml
+└── .env.example
 ```
 
 ---
 
-## Setup
+## Running the VPS signaling server
 
-### Step 1 — VPS
+### Prerequisites
+- Docker and Docker Compose installed on the VPS
+- Port 8080 (or your chosen PORT) open in the firewall
 
-Point a subdomain (e.g. `netbird.your-domain.com`) at your VPS, then run the one-liner:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main/scripts/setup_vps.sh | bash
-```
-
-Or clone and run manually:
+### Steps
 
 ```bash
 git clone https://github.com/rabeeqiblawi/nerd-hand-tunnel /opt/nerdhand-tunnel
-bash /opt/nerdhand-tunnel/scripts/setup_vps.sh
+cd /opt/nerdhand-tunnel
+
+cp .env.example .env
+# Edit .env and set a strong APP_SECRET
+nano .env
+
+docker compose up -d
 ```
 
-The script installs Docker, opens firewall ports, fills in your domain, generates secrets, and starts the stack.
-
-**Ports to open on the VPS firewall:**
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 80, 443 | TCP | Caddy (HTTP + HTTPS) |
-| 443 | UDP | HTTP/3 |
-| 3478 | UDP | STUN |
-| 5349 | TCP/UDP | TURN over TLS |
-| 33073 | TCP | NetBird management gRPC |
-| 49152–65535 | UDP | TURN relay range |
-
-### Step 2 — Host machine (Mac/PC)
+Check it is running:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main/scripts/setup_host.sh | bash
+curl http://localhost:8080/health
+# {"status":"ok"}
 ```
 
-Installs the NetBird client, prompts for your management URL and a setup key (generated in the dashboard), and enrolls the machine. The host gets a stable NetBird IP (e.g. `100.64.0.1`).
+---
 
-### Step 3 — Phone
+## Running the PC client
 
-Install the NetBird app and join the same network using a setup key:
+### Prerequisites
+- Go 1.22+ installed (to build), or use a pre-built binary
+- `wireguard-tools` installed:
+  - macOS: `brew install wireguard-tools`
+  - Ubuntu/Debian: `sudo apt install wireguard-tools`
+  - Fedora: `sudo dnf install wireguard-tools`
 
-- **iOS**: [App Store](https://apps.apple.com/app/id1557638990)
-- **Android**: [Play Store](https://play.google.com/store/apps/details?id=io.netbird.client)
+### Build
 
-In the app: **Settings → Management URL** → enter `https://netbird.your-domain.com:33073`, then paste a setup key.
+```bash
+cd /opt/nerdhand-tunnel
+go build -o client ./cmd/client
+```
 
-### Step 4 — Flutter app pairing
+### Start the tunnel
 
-Once both devices are on the NetBird network, pair the NerdHand Flutter app using the **host's NetBird IP** instead of the LAN IP. The host's NetBird IP is visible in `netbird status` or on the dashboard.
+```bash
+./client start \
+  --server https://signal.your-domain.com \
+  --secret your-app-secret
+```
+
+This will:
+1. Generate (or load) a WireGuard keypair from `~/.nerdhand/wg_key.json`
+2. Discover your public IP via ipify
+3. Register with the signaling server and get a tunnel IP (e.g. `10.99.0.1`)
+4. Write a WireGuard config to `/tmp/wg0.conf` and bring up the `wg0` interface
+5. Poll every 5 seconds for new clients, adding them as WireGuard peers automatically
+
+### Generate a pairing code
+
+In a second terminal (while `client start` is still running):
+
+```bash
+./client pair \
+  --server https://signal.your-domain.com \
+  --secret your-app-secret \
+  --token your-daemon-bearer-token
+```
+
+Output example:
+
+```
+┌─────────────────────────────────┐
+│  Pairing Code: K7M-4XQ          │
+│  Expires in:   5    minutes    │
+└─────────────────────────────────┘
+
+Enter this code in the Terminator app → Add Computer → Online
+```
+
+The daemon token can also be stored in `~/.nerdhand/.env` as `DAEMON_TOKEN=...` or `API_TOKEN=...` and it will be read automatically.
+
+### Stop the tunnel
+
+```bash
+./client stop
+```
+
+---
+
+## How pairing works
+
+1. **PC runs `client start`** — registers its WireGuard public key and public IP with the signaling server. Gets assigned a tunnel IP (e.g. `10.99.0.1`).
+2. **PC runs `client pair`** — generates a short-lived code (5 minutes) like `K7M-4XQ`.
+3. **User enters code in the Flutter app** — the app calls `POST /v1/pair/redeem` with the code and its own WireGuard public key.
+4. **Server responds** with the PC's public key, endpoint, tunnel IP, and a full WireGuard `.conf` file for the app to import. The app gets its own tunnel IP (e.g. `10.99.0.3`).
+5. **PC polls `GET /v1/peer/clients`** — sees the new client, runs `wg set wg0 peer ...` to add it as a WireGuard peer.
+6. **Direct P2P link established** — the app can now reach the PC daemon at `10.99.0.1:8000` over WireGuard.
+
+---
+
+## Security model
+
+- All API endpoints (except `/health`) require the `X-App-Secret` header matching the `APP_SECRET` environment variable.
+- Missing or wrong secret returns `403 Forbidden`.
+- Pairing codes expire after 5 minutes and can only be redeemed once.
+- The server is stateless — it holds no private keys, no traffic, no credentials beyond the daemon token passed through during pairing.
+
+---
+
+## API reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check (no auth) |
+| `POST` | `/v1/peer/register` | PC registers its WireGuard key + endpoint |
+| `POST` | `/v1/pair/generate` | PC generates a pairing code |
+| `POST` | `/v1/pair/redeem` | App redeems pairing code, gets WireGuard config |
+| `GET` | `/v1/peer/clients` | PC polls for newly paired clients |
+
+All authenticated endpoints require: `X-App-Secret: <APP_SECRET>`
 
 ---
 
 ## Useful commands
 
 ```bash
-# Check stack status on VPS
-cd /opt/nerdhand-tunnel && docker compose ps
+# VPS — view server logs
+docker compose logs -f signaling
 
-# View logs
-docker compose logs -f management
-docker compose logs -f signal
+# VPS — restart server
+docker compose restart signaling
 
-# Check host enrollment
-netbird status
+# PC — check WireGuard status
+sudo wg show
 
-# Stop / restart
-docker compose down
-docker compose up -d
+# PC — manually add a peer
+sudo wg set wg0 peer <public_key> allowed-ips 10.99.0.X/32
 ```
