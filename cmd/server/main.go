@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -40,22 +42,49 @@ type Client struct {
 	Notified    bool      `json:"-"`
 }
 
+// ─── Relay types ─────────────────────────────────────────────────────────────
+
+type relayRequest struct {
+	ReqID   string              `json:"req_id"`
+	Method  string              `json:"method"`
+	Path    string              `json:"path"`
+	Query   string              `json:"query"`
+	Headers map[string][]string `json:"headers"`
+	Body    string              `json:"body"` // base64
+}
+
+type relayResponse struct {
+	ReqID   string              `json:"req_id"`
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers"`
+	Body    string              `json:"body"` // base64
+}
+
+type pendingRelayReq struct {
+	req    relayRequest
+	respCh chan relayResponse
+}
+
 // ─── In-memory store ────────────────────────────────────────────────────────
 
 type Store struct {
-	mu        sync.RWMutex
-	peers     map[string]*Peer   // peer_id → Peer
-	codes     map[string]*PairingCode // code → PairingCode
-	clients   map[string][]*Client    // peer_id → []Client
-	ipCounter int
+	mu          sync.RWMutex
+	peers       map[string]*Peer        // peer_id → Peer
+	codes       map[string]*PairingCode // code → PairingCode
+	clients     map[string][]*Client    // peer_id → []Client
+	ipCounter   int
+	relayQueues map[string]chan *pendingRelayReq
+	relayMu     sync.Mutex
+	relayPending sync.Map // req_id → *pendingRelayReq
 }
 
 func NewStore() *Store {
 	return &Store{
-		peers:     make(map[string]*Peer),
-		codes:     make(map[string]*PairingCode),
-		clients:   make(map[string][]*Client),
-		ipCounter: 0,
+		peers:       make(map[string]*Peer),
+		codes:       make(map[string]*PairingCode),
+		clients:     make(map[string][]*Client),
+		ipCounter:   0,
+		relayQueues: make(map[string]chan *pendingRelayReq),
 	}
 }
 
@@ -75,6 +104,17 @@ func (s *Store) cleanExpiredCodes() {
 			delete(s.codes, code)
 		}
 	}
+}
+
+func (s *Store) getRelayQueue(peerID string) chan *pendingRelayReq {
+	s.relayMu.Lock()
+	defer s.relayMu.Unlock()
+	q, ok := s.relayQueues[peerID]
+	if !ok {
+		q = make(chan *pendingRelayReq, 32)
+		s.relayQueues[peerID] = q
+	}
+	return q
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -326,13 +366,14 @@ PersistentKeepalive = 25
 	log.Printf("[pair/redeem] code=%s peer_id=%s client_tunnel_ip=%s", req.Code, pc.PeerID, clientTunnelIP)
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"pc_wg_public_key":  peer.WGPublicKey,
-		"pc_endpoint":       pcEndpoint,
-		"pc_tunnel_ip":      peer.TunnelIP,
-		"client_tunnel_ip":  clientTunnelIP,
-		"daemon_token":      pc.DaemonToken,
-		"daemon_port":       pc.DaemonPort,
-		"wg_config":         wgConfig,
+		"pc_wg_public_key": peer.WGPublicKey,
+		"pc_endpoint":      pcEndpoint,
+		"pc_tunnel_ip":     peer.TunnelIP,
+		"client_tunnel_ip": clientTunnelIP,
+		"daemon_token":     pc.DaemonToken,
+		"daemon_port":      pc.DaemonPort,
+		"wg_config":        wgConfig,
+		"peer_id":          peer.ID,
 	})
 }
 
@@ -384,6 +425,167 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// ─── Relay handlers ──────────────────────────────────────────────────────────
+
+// GET /v1/relay/{peer_id}/poll
+// Requires X-App-Secret. Long-polls up to 25s for the next queued request.
+// Returns 408 on timeout, 200 with relayRequest JSON on success.
+func (s *Store) handleRelayPoll(w http.ResponseWriter, r *http.Request) {
+	peerID := r.PathValue("peer_id")
+
+	// Verify the peer exists.
+	s.mu.RLock()
+	_, exists := s.peers[peerID]
+	s.mu.RUnlock()
+	if !exists {
+		writeError(w, http.StatusNotFound, "peer not found")
+		return
+	}
+
+	queue := s.getRelayQueue(peerID)
+
+	select {
+	case pending := <-queue:
+		// Store in pending map so handleRelayRespond can find it.
+		s.relayPending.Store(pending.req.ReqID, pending)
+		writeJSON(w, http.StatusOK, pending.req)
+	case <-time.After(25 * time.Second):
+		w.WriteHeader(http.StatusRequestTimeout)
+	case <-r.Context().Done():
+		// Client disconnected.
+	}
+}
+
+// POST /v1/relay/{peer_id}/respond
+// Requires X-App-Secret. Accepts a relayResponse JSON and routes it to the
+// waiting handleRelayProxy goroutine via the pending request's response channel.
+func (s *Store) handleRelayRespond(w http.ResponseWriter, r *http.Request) {
+	var resp relayResponse
+	if err := json.NewDecoder(r.Body).Decode(&resp); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if resp.ReqID == "" {
+		writeError(w, http.StatusBadRequest, "req_id is required")
+		return
+	}
+
+	val, ok := s.relayPending.LoadAndDelete(resp.ReqID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "req_id not found or already responded")
+		return
+	}
+
+	pending := val.(*pendingRelayReq)
+	select {
+	case pending.respCh <- resp:
+	default:
+		// Phone already timed out; discard silently.
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// /v1/relay/{peer_id}/{rest...}
+// No auth. Proxies any HTTP method/path from the phone to the daemon via the
+// relay queue. Waits up to 120s for the daemon to respond.
+func (s *Store) handleRelayProxy(w http.ResponseWriter, r *http.Request) {
+	peerID := r.PathValue("peer_id")
+	rest := r.PathValue("rest")
+
+	// Normalize path — ensure it starts with "/".
+	path := "/" + rest
+
+	// Verify the peer exists.
+	s.mu.RLock()
+	_, exists := s.peers[peerID]
+	s.mu.RUnlock()
+	if !exists {
+		writeError(w, http.StatusNotFound, "peer not found")
+		return
+	}
+
+	// Read and base64-encode the request body.
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32<<20)) // 32 MiB cap
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	bodyB64 := base64.StdEncoding.EncodeToString(bodyBytes)
+
+	// Build the relay request, filtering hop-by-hop headers.
+	reqHeaders := make(map[string][]string)
+	hopByHop := map[string]bool{
+		"connection":          true,
+		"keep-alive":          true,
+		"proxy-authenticate":  true,
+		"proxy-authorization": true,
+		"te":                  true,
+		"trailers":            true,
+		"transfer-encoding":   true,
+		"upgrade":             true,
+	}
+	for k, vs := range r.Header {
+		lower := strings.ToLower(k)
+		if !hopByHop[lower] {
+			reqHeaders[k] = vs
+		}
+	}
+
+	reqID := randomHex(16)
+	pending := &pendingRelayReq{
+		req: relayRequest{
+			ReqID:   reqID,
+			Method:  r.Method,
+			Path:    path,
+			Query:   r.URL.RawQuery,
+			Headers: reqHeaders,
+			Body:    bodyB64,
+		},
+		respCh: make(chan relayResponse, 1),
+	}
+
+	queue := s.getRelayQueue(peerID)
+
+	select {
+	case queue <- pending:
+	default:
+		writeError(w, http.StatusServiceUnavailable, "relay queue full")
+		return
+	}
+
+	select {
+	case resp := <-pending.respCh:
+		// Copy response headers, skipping Content-Length (Go sets it).
+		for k, vs := range resp.Headers {
+			if strings.ToLower(k) == "content-length" {
+				continue
+			}
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+
+		// Decode body.
+		decoded, err := base64.StdEncoding.DecodeString(resp.Body)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "failed to decode relay response body")
+			return
+		}
+
+		w.WriteHeader(resp.Status)
+		_, _ = w.Write(decoded)
+
+	case <-time.After(120 * time.Second):
+		// Clean up the pending entry so the daemon response (if late) is discarded.
+		s.relayPending.Delete(reqID)
+		writeError(w, http.StatusGatewayTimeout, "daemon did not respond in time")
+
+	case <-r.Context().Done():
+		s.relayPending.Delete(reqID)
+	}
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -422,6 +624,12 @@ func main() {
 	mux.HandleFunc("/v1/pair/generate", auth(store.handlePairGenerate))
 	mux.HandleFunc("/v1/pair/redeem", auth(store.handlePairRedeem))
 	mux.HandleFunc("/v1/peer/clients", auth(store.handlePeerClients))
+
+	// Relay endpoints — specific method routes take priority over the catch-all
+	// in Go 1.22+ ServeMux. Register before the "/" catch-all.
+	mux.HandleFunc("GET /v1/relay/{peer_id}/poll", auth(store.handleRelayPoll))
+	mux.HandleFunc("POST /v1/relay/{peer_id}/respond", auth(store.handleRelayRespond))
+	mux.HandleFunc("/v1/relay/{peer_id}/{rest...}", store.handleRelayProxy)
 
 	// Log all unmatched routes.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
