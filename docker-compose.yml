@@ -1,0 +1,101 @@
+---
+# NerdHand — NetBird self-hosted stack
+#
+# What runs here (VPS only):
+#   - NetBird Management server  →  device enrollment, key exchange, ACLs
+#   - NetBird Signal server      →  WebRTC-like ICE/STUN signaling for P2P setup
+#   - Coturn                     →  TURN relay (fallback when direct P2P fails)
+#   - Caddy                      →  TLS termination (auto Let's Encrypt)
+#
+# What does NOT run here:
+#   - Your actual traffic.  Once two peers are connected the data flows
+#     directly between them over WireGuard.  The VPS is idle after handshake.
+#
+# Usage:
+#   cp .env.example .env && nano .env   # fill in your domain + secrets
+#   docker compose up -d
+
+version: "3.8"
+
+services:
+
+  # ── Coturn — STUN + TURN relay ─────────────────────────────────────────────
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host          # needs direct UDP access for STUN/TURN
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+  # ── NetBird Signal server ──────────────────────────────────────────────────
+  signal:
+    image: netbirdio/signal:latest
+    restart: unless-stopped
+    volumes:
+      - netbird_signal:/var/lib/netbird
+    ports:
+      - "10000:10000"
+    logging: &default_logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── NetBird Management server ──────────────────────────────────────────────
+  management:
+    image: netbirdio/management:latest
+    restart: unless-stopped
+    depends_on:
+      - signal
+    volumes:
+      - netbird_mgmt:/var/lib/netbird
+      - ./management.json:/etc/netbird/management.json:ro
+    ports:
+      - "33073:33073"
+      - "33073:33073/udp"
+    command: [
+      "--port", "33073",
+      "--log-level", "info",
+      "--disable-anonymous-metrics",
+      "--single-account-mode-domain", "${NETBIRD_DOMAIN}",
+      "--dns-domain", "netbird.selfhosted"
+    ]
+    logging: *default_logging
+
+  # ── NetBird Dashboard (optional web UI) ────────────────────────────────────
+  dashboard:
+    image: netbirdio/dashboard:latest
+    restart: unless-stopped
+    environment:
+      - AUTH_AUDIENCE=${NETBIRD_AUTH_AUDIENCE:-netbird}
+      - NETBIRD_MGMT_API_ENDPOINT=https://${NETBIRD_DOMAIN}:33073
+      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://${NETBIRD_DOMAIN}:33073
+      - USE_AUTH0=false
+    ports:
+      - "33080:80"
+    logging: *default_logging
+
+  # ── Caddy — automatic HTTPS / reverse proxy ────────────────────────────────
+  caddy:
+    image: caddy:latest
+    restart: unless-stopped
+    depends_on:
+      - signal
+      - management
+      - dashboard
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *default_logging
+
+volumes:
+  netbird_mgmt:
+  netbird_signal:
+  caddy_data:
+  caddy_config:

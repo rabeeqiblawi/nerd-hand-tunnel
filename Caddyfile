@@ -1,0 +1,23 @@
+# Caddy automatically obtains and renews TLS certificates via Let's Encrypt.
+# Replace netbird.your-domain.com with the value of NETBIRD_DOMAIN in .env
+
+netbird.your-domain.com {
+
+    # NetBird Dashboard
+    reverse_proxy /  dashboard:80
+
+    # NetBird Management API (gRPC + HTTP)
+    reverse_proxy /api/* management:33073
+    reverse_proxy /management.ManagementService/* management:33073 {
+        transport http {
+            versions h2c 2
+        }
+    }
+
+    # NetBird Signal (gRPC)
+    reverse_proxy /signalexchange.SignalExchange/* signal:10000 {
+        transport http {
+            versions h2c 2
+        }
+    }
+}

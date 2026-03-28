@@ -1,0 +1,44 @@
+{
+  "Stuns": [
+    {
+      "Proto": "udp",
+      "URI": "stun:netbird.your-domain.com:3478",
+      "Username": "",
+      "Password": null
+    }
+  ],
+  "TURNConfig": {
+    "Timeouts": {
+      "TimeToLive": 86400,
+      "RoundTrip": 25
+    },
+    "Turns": [
+      {
+        "Proto": "udp",
+        "URI": "turn:netbird.your-domain.com:3478",
+        "Username": "netbird",
+        "Password": null
+      }
+    ],
+    "CredentialsTTL": "12h",
+    "Secret": "REPLACE_WITH_TURN_SECRET"
+  },
+  "Signal": {
+    "Proto": "https",
+    "URI": "netbird.your-domain.com:443",
+    "Username": "",
+    "Password": null
+  },
+  "Datadir": "/var/lib/netbird/",
+  "HttpConfig": {
+    "LetsEncryptDomain": "",
+    "CertFile": "",
+    "CertKey": "",
+    "AuthAudience": "netbird",
+    "AuthIssuer": "",
+    "AuthKeysLocation": "",
+    "OIDCConfigEndpoint": ""
+  },
+  "IdpManagerConfig": null,
+  "DeviceAuthorizationFlow": null
+}
