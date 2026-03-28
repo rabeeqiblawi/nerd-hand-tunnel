@@ -55,13 +55,13 @@ nerdhand-tunnel/
 Point a subdomain (e.g. `netbird.your-domain.com`) at your VPS, then run the one-liner:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerdhand-tunnel/main/scripts/setup_vps.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main/scripts/setup_vps.sh | bash
 ```
 
 Or clone and run manually:
 
 ```bash
-git clone https://github.com/rabeeqiblawi/nerdhand-tunnel /opt/nerdhand-tunnel
+git clone https://github.com/rabeeqiblawi/nerd-hand-tunnel /opt/nerdhand-tunnel
 bash /opt/nerdhand-tunnel/scripts/setup_vps.sh
 ```
 
@@ -81,7 +81,7 @@ The script installs Docker, opens firewall ports, fills in your domain, generate
 ### Step 2 — Host machine (Mac/PC)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerdhand-tunnel/main/scripts/setup_host.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main/scripts/setup_host.sh | bash
 ```
 
 Installs the NetBird client, prompts for your management URL and a setup key (generated in the dashboard), and enrolls the machine. The host gets a stable NetBird IP (e.g. `100.64.0.1`).

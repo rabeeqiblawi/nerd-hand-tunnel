@@ -3,10 +3,10 @@
 # NerdHand — VPS bootstrap for NetBird self-hosted
 #
 # One-liner install (run on a fresh Ubuntu/Debian VPS):
-#   curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerdhand-tunnel/main/scripts/setup_vps.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main/scripts/setup_vps.sh | bash
 #
 # Or clone and run:
-#   git clone https://github.com/rabeeqiblawi/nerdhand-tunnel /opt/nerdhand-tunnel
+#   git clone https://github.com/rabeeqiblawi/nerd-hand-tunnel /opt/nerdhand-tunnel
 #   bash /opt/nerdhand-tunnel/scripts/setup_vps.sh
 #
 # What this does:
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 INSTALL_DIR="/opt/nerdhand-tunnel"
-REPO_RAW="https://raw.githubusercontent.com/rabeeqiblawi/nerdhand-tunnel/main"
+REPO_RAW="https://raw.githubusercontent.com/rabeeqiblawi/nerd-hand-tunnel/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 REPO_DIR="$(dirname "$SCRIPT_DIR" 2>/dev/null || echo "")"
 
